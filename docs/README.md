@@ -20,6 +20,9 @@ We tested `myftp.py` against `inet.cs.fiu.edu` (`demo/demopass`) instead of runn
 - `put <local-file>` ⚠️  
   The server **does create** an entry in the remote (ftp-project) root, but it **cannot be opened/read afterward** (permissions). Follow-up access attempts yield 550.
 
+- `delete <remote-file>` ❌ → **550**  
+  As non-owners, we do not have permission to remove files; delete operations return 550.
+
 - `quit` ✅  
   Cleanly closes the session (221).
 
