@@ -10,6 +10,8 @@ import sys                            # for command-line args and exit
                      
 CRLF = "\r\n"
 
+def q(s): 
+    return f'"{s}"' if ' ' in s else s
 
 def quitFTP(clientSocket):
     """Send QUIT and print the server reply, then close the control socket."""
@@ -42,32 +44,28 @@ def receiveData(clientSocket):
 # You will not be penalized if you don't
 
 def modePASV(clientSocket):
-    """Enter passive mode and open a data socket. Returns (227, dataSocket) on success.
-    If parsing/connection fails, returns (0, None).
-    """
-    data = sendCommand(clientSocket, "PASV")          # ask server to enter PASV                     
-    status = 0                                        # default (failure)                            
-    dataSocket = None                                 # placeholder                                   
-
-    if data.startswith("227"):                        # server accepted PASV                         
-        status = 227                                  # mark success                                  
-        # Extract numbers inside parentheses: (h1,h2,h3,h4,p1,p2)                                     
-        start = data.find('(')                        # locate '('                                    
-        end = data.find(')', start)                   # locate matching ')'                           
-        if start != -1 and end != -1:                 # ensure both exist                             
-            nums = data[start+1:end].split(',')       # split into list                               
-            if len(nums) == 6:                        # must be 6 numbers                             
-                h1,h2,h3,h4,p1,p2 = nums              # unpack strings                                
-                ip = f"{h1}.{h2}.{h3}.{h4}"          # build dotted-quad IP                          
-                port = (int(p1) << 8) + int(p2)       # compute port = p1*256 + p2                    
-                dataSocket = socket(AF_INET, SOCK_STREAM)  # create TCP data socket 
-                dataSocket.settimeout(10) # adds timeout in modePASV                   
-                dataSocket.connect((ip, port))        # connect to server's data endpoint             
-            else:
-                status, dataSocket = 0, None          # malformed tuple                               
-        else:
-            status, dataSocket = 0, None              # missing parentheses                           
-    return status, dataSocket                         # caller handles usage/close                    
+    data = sendCommand(clientSocket, "PASV")
+    if data.startswith("227"):
+        a, b = data.find('('), data.find(')')
+        if a != -1 and b != -1:
+            nums = data[a+1:b].split(',')
+            if len(nums) == 6:
+                p1, p2 = int(nums[4]), int(nums[5])
+                port = (p1 << 8) + p2
+                ip = clientSocket.getpeername()[0]  # use control peer IP (fixes Docker/NAT)
+                s = socket(AF_INET, SOCK_STREAM); s.settimeout(10); s.connect((ip, port))
+                return 227, s
+    # Fallback: EPSV (better behind NAT)
+    data = sendCommand(clientSocket, "EPSV")
+    if data.startswith("229"):
+        inside = data[data.find('(')+1:data.find(')')]
+        parts = inside.split('|')  # format: (|||port|)
+        port = int(parts[-2])
+        ip = clientSocket.getpeername()[0]
+        s = socket(AF_INET, SOCK_STREAM); s.settimeout(10); s.connect((ip, port))
+        return 229, s
+    print("PASV/EPSV failed:", data.strip())
+    return 0, None# caller handles usage/close                    
 
 
 def main():
@@ -136,7 +134,7 @@ def main():
         # ---------------- ls ----------------
         if cmd == 'ls':                               # list remote directory                           
             pasvStatus, dataSocket = modePASV(clientSocket)  # enter passive mode                       
-            if pasvStatus == 227 and dataSocket is not None: # proceed if data socket ready             
+            if pasvStatus in (227, 229) and dataSocket is not None: # proceed if data socket ready             
                 pre = sendCommand(clientSocket, "LIST")       # ask server to list                       
                 print(pre.strip())                              # print pre-transfer reply (150/125)  
                 if not (pre.startswith("150") or pre.startswith("125")):
@@ -162,7 +160,8 @@ def main():
             if len(tokens) != 2:                    # ensure exactly one argument                      
                 print("Failure: Usage: cd <remote-dir>")       # usage hint                                 
             else:
-                resp = sendCommand(clientSocket, f'CWD "{tokens[1]}"')  # issue CWD                          
+                arg = tokens[1]
+                resp = sendCommand(clientSocket, f'CWD {q(arg)}')  # issue CWD                          
                 print(resp.strip())                   # print server reply (250 on success)             
 
         # ---------------- get <remote-file> ----------------
@@ -173,9 +172,13 @@ def main():
             remote = tokens[1]                        # remote file path/name                            
             local = remote.split('/')[-1]             # save as basename locally                         
             pasvStatus, dataSocket = modePASV(clientSocket)   # prepare data channel                       
-            if pasvStatus == 227 and dataSocket is not None:  # proceed if OK                              
+            if pasvStatus in (227, 229) and dataSocket is not None:  # proceed if OK                              
                 pre = sendCommand(clientSocket, f'RETR "{remote}"')  # request file                         
-                print(pre.strip())                    # print pre-transfer reply (150/125)               
+                print(pre.strip())                    # print pre-transfer reply (150/125)   
+                if not (pre.startswith("150") or pre.startswith("125")):
+                    print("Failure:", pre.strip())
+                    dataSocket.close()
+                    continue            
                 bytes_recv = 0                        # counter for bytes received                       
                 with open(local, 'wb') as f:          # open local file for binary write                 
                     while True:                       # read until EOF on data socket                    
@@ -203,10 +206,16 @@ def main():
                 print(f"Failure: Local file not found: {local}")  # report missing file                  
                 continue                              # skip                                             
             pasvStatus, dataSocket = modePASV(clientSocket)   # open data channel                          
-            if pasvStatus == 227 and dataSocket is not None:  # proceed if OK 
+            if pasvStatus in (227, 229) and dataSocket is not None:  # proceed if OK 
                 remote_name = local.split('/')[-1]                             
                 pre = sendCommand(clientSocket, f'STOR "{remote_name}"') # announce upload       
-                print(pre.strip())                    # print pre-transfer reply (150/125)               
+                print(pre.strip())                    # print pre-transfer reply (150/125)
+                
+                if not (pre.startswith("150") or pre.startswith("125")):
+                    print("Failure:", pre.strip())   # likely 550 Permission denied
+                    dataSocket.close()
+                    continue               
+                
                 bytes_sent = 0                        # counter for bytes sent                           
                 with f:                               # ensure file closed after sending                 
                     while True:                       # loop until EOF                                   
